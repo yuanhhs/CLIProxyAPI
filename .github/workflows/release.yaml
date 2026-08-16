@@ -1,0 +1,91 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: cliproxyapi-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Refresh models catalog
+        run: |
+          git fetch --depth 1 https://github.com/router-for-me/models.git main
+          git show FETCH_HEAD:models.json > internal/registry/models/models.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve release tag
+        id: release
+        run: |
+          set -euo pipefail
+          latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1 || true)"
+          if [ -z "${latest_tag}" ]; then
+            next_tag="v1.0.0"
+          else
+            version="${latest_tag#v}"
+            IFS='.' read -r major minor patch <<< "${version}"
+            next_tag="v${major}.${minor}.$((patch + 1))"
+          fi
+          echo "tag=${next_tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build Linux AMD64 package
+        env:
+          VERSION: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          commit="$(git rev-parse --short HEAD)"
+          package_name="CLIProxyAPI_${VERSION}_linux_amd64"
+          mkdir -p "dist/${package_name}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X main.Version=${VERSION} -X main.Commit=${commit} -X main.BuildDate=${build_date}" \
+            -o "dist/${package_name}/cli-proxy-api" ./cmd/server
+          cp LICENSE README.md README_CN.md config.example.yaml "dist/${package_name}/"
+          tar -czf "dist/${package_name}.tar.gz" -C dist "${package_name}"
+          sha256sum "dist/${package_name}.tar.gz" > dist/checksums.txt
+          ls -lh "dist/${package_name}.tar.gz" dist/checksums.txt
+
+      - name: Generate release notes
+        run: |
+          set -euo pipefail
+          previous_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1 || true)"
+          if [ -n "${previous_tag}" ]; then
+            git log --pretty=format:"- %h %s" "${previous_tag}..${GITHUB_SHA}" > release-notes.md
+          else
+            git log -1 --pretty=format:"- %h %s" "${GITHUB_SHA}" > release-notes.md
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          body_path: release-notes.md
+          tag_name: ${{ steps.release.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.release.outputs.tag }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
