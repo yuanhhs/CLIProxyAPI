@@ -9,7 +9,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
-	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 )
 
 func TestGetUsageQueuePopsRequestedRecords(t *testing.T) {
@@ -68,35 +67,6 @@ func TestGetUsageQueueInvalidCountDoesNotPop(t *testing.T) {
 			t.Fatalf("remaining queue = %q, want original item", remaining)
 		}
 	})
-}
-
-func TestGetUsageRevision(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	t.Setenv("USAGE_DB_DRIVER", "sqlite")
-	t.Setenv("USAGE_DB_DSN", t.TempDir()+"/sql.db")
-	store, err := internalusage.Open(t.Context(), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-
-	rec := httptest.NewRecorder()
-	ginCtx, _ := gin.CreateTestContext(rec)
-	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage/revision", nil)
-
-	h := &Handler{usageStore: store}
-	h.GetUsageRevision(ginCtx)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	var revision internalusage.Revision
-	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &revision); errUnmarshal != nil {
-		t.Fatalf("unmarshal response: %v", errUnmarshal)
-	}
-	if revision.LatestID != 0 || revision.TotalRows != 0 {
-		t.Fatalf("revision = %+v, want empty", revision)
-	}
 }
 
 func TestParseUsageRange(t *testing.T) {

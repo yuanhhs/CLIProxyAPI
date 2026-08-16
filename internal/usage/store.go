@@ -58,11 +58,6 @@ type StatisticsSnapshot struct {
 	TokensByHour   map[string]int64 `json:"tokens_by_hour"`
 }
 
-type Revision struct {
-	LatestID  int64 `json:"latest_id"`
-	TotalRows int64 `json:"total_rows"`
-}
-
 type APISnapshot struct {
 	TotalRequests int64                    `json:"total_requests"`
 	TotalTokens   int64                    `json:"total_tokens"`
@@ -98,8 +93,6 @@ type Store struct {
 	snapshotMu    sync.RWMutex
 	snapshot      StatisticsSnapshot
 	snapshotReady bool
-	revision      Revision
-	revisionReady bool
 }
 
 func Open(ctx context.Context, configPath string) (*Store, error) {
@@ -222,49 +215,6 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// Revision returns a lightweight marker that changes whenever usage rows change.
-func (s *Store) Revision(ctx context.Context) (Revision, error) {
-	if s == nil || s.db == nil {
-		return Revision{}, errors.New("usage database is not initialized")
-	}
-	// PostgreSQL deployments may share the database across processes, so do
-	// not serve an in-process revision cache there.
-	if s.dialect == "postgres" {
-		return s.queryRevision(ctx)
-	}
-	s.snapshotMu.RLock()
-	if s.revisionReady {
-		revision := s.revision
-		s.snapshotMu.RUnlock()
-		return revision, nil
-	}
-	s.snapshotMu.RUnlock()
-
-	s.snapshotMu.Lock()
-	defer s.snapshotMu.Unlock()
-	if s.revisionReady {
-		return s.revision, nil
-	}
-	revision, err := s.queryRevision(ctx)
-	if err != nil {
-		return Revision{}, err
-	}
-	s.revision = revision
-	s.revisionReady = true
-	return revision, nil
-}
-
-func (s *Store) queryRevision(ctx context.Context) (Revision, error) {
-	var revision Revision
-	if err := s.db.QueryRowContext(
-		ctx,
-		`SELECT COALESCE(MAX(id), 0), COUNT(*) FROM usage_events`,
-	).Scan(&revision.LatestID, &revision.TotalRows); err != nil {
-		return Revision{}, fmt.Errorf("query usage revision: %w", err)
-	}
-	return revision, nil
-}
-
 func (s *Store) Record(ctx context.Context, record coreusage.Record) error {
 	if s == nil || s.db == nil {
 		return errors.New("usage database is not initialized")
@@ -309,7 +259,6 @@ func (s *Store) Record(ctx context.Context, record coreusage.Record) error {
 	if s.snapshotReady {
 		aggregateEvent(&s.snapshot, event)
 	}
-	s.revisionReady = false
 	return nil
 }
 
@@ -509,7 +458,6 @@ func (s *Store) MergeSnapshot(ctx context.Context, snapshot StatisticsSnapshot) 
 	if result.Added > 0 {
 		s.snapshotMu.Lock()
 		s.snapshotReady = false
-		s.revisionReady = false
 		s.snapshotMu.Unlock()
 	}
 	return result, nil

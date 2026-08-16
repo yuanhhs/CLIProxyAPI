@@ -71,11 +71,6 @@ func (h *Handler) GetUsage(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "usage database unavailable"})
 		return
 	}
-	revision, err := store.Revision(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
 	since, ranged, err := parseUsageRange(c.Query("range"), time.Now().UTC())
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -94,7 +89,6 @@ func (h *Handler) GetUsage(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"usage":           snapshot,
 		"failed_requests": snapshot.FailureCount,
-		"revision":        revision,
 	})
 }
 
@@ -111,21 +105,6 @@ func parseUsageRange(value string, now time.Time) (time.Time, bool, error) {
 	default:
 		return time.Time{}, false, errors.New("range must be one of 24h, 7d, 30d, all")
 	}
-}
-
-// GetUsageRevision returns a cheap change marker for live usage dashboards.
-func (h *Handler) GetUsageRevision(c *gin.Context) {
-	store := h.getUsageStore()
-	if store == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "usage database unavailable"})
-		return
-	}
-	revision, err := store.Revision(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, revision)
 }
 
 func (h *Handler) ExportUsage(c *gin.Context) {

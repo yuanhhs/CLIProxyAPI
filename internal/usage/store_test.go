@@ -81,43 +81,6 @@ func TestSQLiteOfficialUsageSnapshotPersistsAllTokenTypes(t *testing.T) {
 	}
 }
 
-func TestSQLiteUsageRevisionTracksPersistedRows(t *testing.T) {
-	t.Setenv("USAGE_DB_DRIVER", "sqlite")
-	t.Setenv("USAGE_DB_DSN", t.TempDir()+"/sql.db")
-	store, err := Open(context.Background(), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-
-	revision, err := store.Revision(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if revision.LatestID != 0 || revision.TotalRows != 0 {
-		t.Fatalf("empty revision = %+v", revision)
-	}
-
-	err = store.Record(context.Background(), coreusage.Record{
-		Provider:    "codex",
-		Model:       "gpt-5",
-		APIKey:      "client-key",
-		RequestedAt: time.Date(2026, 8, 16, 1, 2, 3, 0, time.UTC),
-		Detail:      coreusage.Detail{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	revision, err = store.Revision(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if revision.LatestID <= 0 || revision.TotalRows != 1 {
-		t.Fatalf("revision after record = %+v", revision)
-	}
-}
-
 func TestSQLiteUsageSnapshotCacheTracksNewRecords(t *testing.T) {
 	t.Setenv("USAGE_DB_DRIVER", "sqlite")
 	t.Setenv("USAGE_DB_DSN", t.TempDir()+"/sql.db")
