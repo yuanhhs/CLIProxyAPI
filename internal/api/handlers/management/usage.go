@@ -76,7 +76,17 @@ func (h *Handler) GetUsage(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	snapshot, err := store.Snapshot(c.Request.Context())
+	since, ranged, err := parseUsageRange(c.Query("range"), time.Now().UTC())
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var snapshot usage.StatisticsSnapshot
+	if ranged {
+		snapshot, err = store.SnapshotSince(c.Request.Context(), since)
+	} else {
+		snapshot, err = store.Snapshot(c.Request.Context())
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -86,6 +96,21 @@ func (h *Handler) GetUsage(c *gin.Context) {
 		"failed_requests": snapshot.FailureCount,
 		"revision":        revision,
 	})
+}
+
+func parseUsageRange(value string, now time.Time) (time.Time, bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "all":
+		return time.Time{}, false, nil
+	case "24h":
+		return now.Add(-24 * time.Hour), true, nil
+	case "7d":
+		return now.Add(-7 * 24 * time.Hour), true, nil
+	case "30d":
+		return now.Add(-30 * 24 * time.Hour), true, nil
+	default:
+		return time.Time{}, false, errors.New("range must be one of 24h, 7d, 30d, all")
+	}
 }
 
 // GetUsageRevision returns a cheap change marker for live usage dashboards.

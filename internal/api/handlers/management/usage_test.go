@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
@@ -95,6 +96,35 @@ func TestGetUsageRevision(t *testing.T) {
 	}
 	if revision.LatestID != 0 || revision.TotalRows != 0 {
 		t.Fatalf("revision = %+v, want empty", revision)
+	}
+}
+
+func TestParseUsageRange(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		value      string
+		wantSince  time.Time
+		wantRanged bool
+		wantError  bool
+	}{
+		{value: "", wantRanged: false},
+		{value: "all", wantRanged: false},
+		{value: "24h", wantSince: now.Add(-24 * time.Hour), wantRanged: true},
+		{value: "7d", wantSince: now.Add(-7 * 24 * time.Hour), wantRanged: true},
+		{value: "30d", wantSince: now.Add(-30 * 24 * time.Hour), wantRanged: true},
+		{value: "invalid", wantError: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.value, func(t *testing.T) {
+			since, ranged, err := parseUsageRange(test.value, now)
+			if (err != nil) != test.wantError {
+				t.Fatalf("error = %v, wantError=%v", err, test.wantError)
+			}
+			if ranged != test.wantRanged || !since.Equal(test.wantSince) {
+				t.Fatalf("since=%v ranged=%v, want since=%v ranged=%v", since, ranged, test.wantSince, test.wantRanged)
+			}
+		})
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -89,6 +90,16 @@ type usageEvent struct {
 type Store struct {
 	db      *sql.DB
 	dialect string
+
+	// The management page polls frequently, while the usage table can contain
+	// a large history. Keep the aggregated snapshot in memory and only rebuild
+	// it after a cold start or an import. Normal request writes update the
+	// cached snapshot incrementally.
+	snapshotMu    sync.RWMutex
+	snapshot      StatisticsSnapshot
+	snapshotReady bool
+	revision      Revision
+	revisionReady bool
 }
 
 func Open(ctx context.Context, configPath string) (*Store, error) {
@@ -213,10 +224,38 @@ func (s *Store) Close() error {
 
 // Revision returns a lightweight marker that changes whenever usage rows change.
 func (s *Store) Revision(ctx context.Context) (Revision, error) {
-	var revision Revision
 	if s == nil || s.db == nil {
-		return revision, errors.New("usage database is not initialized")
+		return Revision{}, errors.New("usage database is not initialized")
 	}
+	// PostgreSQL deployments may share the database across processes, so do
+	// not serve an in-process revision cache there.
+	if s.dialect == "postgres" {
+		return s.queryRevision(ctx)
+	}
+	s.snapshotMu.RLock()
+	if s.revisionReady {
+		revision := s.revision
+		s.snapshotMu.RUnlock()
+		return revision, nil
+	}
+	s.snapshotMu.RUnlock()
+
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	if s.revisionReady {
+		return s.revision, nil
+	}
+	revision, err := s.queryRevision(ctx)
+	if err != nil {
+		return Revision{}, err
+	}
+	s.revision = revision
+	s.revisionReady = true
+	return revision, nil
+}
+
+func (s *Store) queryRevision(ctx context.Context) (Revision, error) {
+	var revision Revision
 	if err := s.db.QueryRowContext(
 		ctx,
 		`SELECT COALESCE(MAX(id), 0), COUNT(*) FROM usage_events`,
@@ -257,17 +296,85 @@ func (s *Store) Record(ctx context.Context, record coreusage.Record) error {
 	}
 	event := usageEvent{APIKey: apiKey, Model: model, Detail: detail}
 	event.EventKey = dedupKey(apiKey, model, detail)
-	_, err := s.insertEvent(ctx, s.db, event)
-	return err
+
+	// Serialize the write with a possible cold-cache rebuild. Otherwise a
+	// rebuild could observe the inserted row before Record updates the cache and
+	// aggregate the same event twice.
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	added, err := s.insertEvent(ctx, s.db, event)
+	if err != nil || !added {
+		return err
+	}
+	if s.snapshotReady {
+		aggregateEvent(&s.snapshot, event)
+	}
+	s.revisionReady = false
+	return nil
 }
 
 func (s *Store) Snapshot(ctx context.Context) (StatisticsSnapshot, error) {
-	result := emptySnapshot()
 	if s == nil || s.db == nil {
-		return result, errors.New("usage database is not initialized")
+		return emptySnapshot(), errors.New("usage database is not initialized")
 	}
-	query := `SELECT api_key,model,timestamp,latency_ms,source,auth_index,reasoning_effort,input_tokens,output_tokens,reasoning_tokens,cached_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,failed FROM usage_events ORDER BY timestamp ASC,id ASC`
-	rows, err := s.db.QueryContext(ctx, query)
+	if s.dialect == "postgres" {
+		return s.loadSnapshot(ctx)
+	}
+
+	s.snapshotMu.RLock()
+	if s.snapshotReady {
+		snapshot := cloneSnapshot(s.snapshot)
+		s.snapshotMu.RUnlock()
+		return snapshot, nil
+	}
+	s.snapshotMu.RUnlock()
+
+	// Serialize the first rebuild so concurrent management requests do not all
+	// scan the same table at once.
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	if s.snapshotReady {
+		return cloneSnapshot(s.snapshot), nil
+	}
+
+	result, err := s.loadSnapshot(ctx)
+	if err != nil {
+		return emptySnapshot(), err
+	}
+	s.snapshot = result
+	s.snapshotReady = true
+	return cloneSnapshot(result), nil
+}
+
+func (s *Store) loadSnapshot(ctx context.Context) (StatisticsSnapshot, error) {
+	return s.querySnapshot(ctx, nil)
+}
+
+// SnapshotSince returns a range-limited aggregate without materializing the
+// complete historical dataset. The timestamp index keeps dashboard refreshes
+// proportional to the selected window instead of total database size.
+func (s *Store) SnapshotSince(ctx context.Context, since time.Time) (StatisticsSnapshot, error) {
+	if s == nil || s.db == nil {
+		return emptySnapshot(), errors.New("usage database is not initialized")
+	}
+	since = since.UTC()
+	return s.querySnapshot(ctx, &since)
+}
+
+func (s *Store) querySnapshot(ctx context.Context, since *time.Time) (StatisticsSnapshot, error) {
+	result := emptySnapshot()
+	query := `SELECT api_key,model,timestamp,latency_ms,source,auth_index,reasoning_effort,input_tokens,output_tokens,reasoning_tokens,cached_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,failed FROM usage_events`
+	args := make([]any, 0, 1)
+	if since != nil {
+		query += ` WHERE timestamp >= ?`
+		value := any(*since)
+		if s.dialect == "sqlite" {
+			value = since.Format(time.RFC3339Nano)
+		}
+		args = append(args, value)
+	}
+	query += ` ORDER BY timestamp ASC,id ASC`
+	rows, err := s.db.QueryContext(ctx, s.bind(query), args...)
 	if err != nil {
 		return result, err
 	}
@@ -303,6 +410,52 @@ func (s *Store) Snapshot(ctx context.Context) (StatisticsSnapshot, error) {
 		return result, err
 	}
 	return result, nil
+}
+
+// cloneSnapshot prevents callers and JSON encoding from racing with an
+// incremental update to the cached aggregate.
+func cloneSnapshot(source StatisticsSnapshot) StatisticsSnapshot {
+	clone := emptySnapshot()
+	clone.TotalRequests = source.TotalRequests
+	clone.SuccessCount = source.SuccessCount
+	clone.FailureCount = source.FailureCount
+	clone.TotalTokens = source.TotalTokens
+	for key, value := range source.RequestsByDay {
+		clone.RequestsByDay[key] = value
+	}
+	for key, value := range source.RequestsByHour {
+		clone.RequestsByHour[key] = value
+	}
+	for key, value := range source.TokensByDay {
+		clone.TokensByDay[key] = value
+	}
+	for key, value := range source.TokensByHour {
+		clone.TokensByHour[key] = value
+	}
+	for apiName, apiSource := range source.APIs {
+		apiClone := APISnapshot{
+			TotalRequests: apiSource.TotalRequests,
+			TotalTokens:   apiSource.TotalTokens,
+			Models:        make(map[string]ModelSnapshot, len(apiSource.Models)),
+		}
+		for modelName, modelSource := range apiSource.Models {
+			details := make([]RequestDetail, len(modelSource.Details))
+			copy(details, modelSource.Details)
+			for index := range details {
+				if modelSource.Details[index].Thinking != nil {
+					thinking := *modelSource.Details[index].Thinking
+					details[index].Thinking = &thinking
+				}
+			}
+			apiClone.Models[modelName] = ModelSnapshot{
+				TotalRequests: modelSource.TotalRequests,
+				TotalTokens:   modelSource.TotalTokens,
+				Details:       details,
+			}
+		}
+		clone.APIs[apiName] = apiClone
+	}
+	return clone
 }
 
 func (s *Store) MergeSnapshot(ctx context.Context, snapshot StatisticsSnapshot) (MergeResult, error) {
@@ -350,6 +503,14 @@ func (s *Store) MergeSnapshot(ctx context.Context, snapshot StatisticsSnapshot) 
 	}
 	if err = tx.Commit(); err != nil {
 		return result, err
+	}
+	// Imports can add many records at once, so invalidate instead of trying to
+	// replay the whole transaction into the in-memory aggregate.
+	if result.Added > 0 {
+		s.snapshotMu.Lock()
+		s.snapshotReady = false
+		s.revisionReady = false
+		s.snapshotMu.Unlock()
 	}
 	return result, nil
 }

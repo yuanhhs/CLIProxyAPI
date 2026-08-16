@@ -118,6 +118,80 @@ func TestSQLiteUsageRevisionTracksPersistedRows(t *testing.T) {
 	}
 }
 
+func TestSQLiteUsageSnapshotCacheTracksNewRecords(t *testing.T) {
+	t.Setenv("USAGE_DB_DRIVER", "sqlite")
+	t.Setenv("USAGE_DB_DSN", t.TempDir()+"/sql.db")
+	store, err := Open(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	record := coreusage.Record{
+		Provider:    "codex",
+		Model:       "gpt-5",
+		APIKey:      "client-key",
+		RequestedAt: time.Date(2026, 8, 16, 1, 2, 3, 0, time.UTC),
+		Detail:      coreusage.Detail{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
+	}
+	if err = store.Record(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Snapshot(context.Background())
+	if err != nil || first.TotalRequests != 1 {
+		t.Fatalf("first cached snapshot = %+v, err=%v", first, err)
+	}
+
+	record.RequestedAt = record.RequestedAt.Add(time.Minute)
+	record.Detail.TotalTokens = 9
+	if err = store.Record(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.TotalRequests != 2 || second.TotalTokens != 15 {
+		t.Fatalf("updated cached snapshot = %+v", second)
+	}
+}
+
+func TestSQLiteSnapshotSinceLimitsHistory(t *testing.T) {
+	t.Setenv("USAGE_DB_DRIVER", "sqlite")
+	t.Setenv("USAGE_DB_DSN", t.TempDir()+"/sql.db")
+	store, err := Open(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	for index, requestedAt := range []time.Time{
+		time.Date(2026, 8, 1, 1, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 16, 1, 0, 0, 0, time.UTC),
+	} {
+		if err = store.Record(context.Background(), coreusage.Record{
+			Provider:    "codex",
+			Model:       "gpt-5",
+			APIKey:      "client-key",
+			RequestedAt: requestedAt,
+			Detail:      coreusage.Detail{InputTokens: int64(index + 1), TotalTokens: int64(index + 1)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	snapshot, err := store.SnapshotSince(
+		context.Background(),
+		time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.TotalRequests != 1 || snapshot.TotalTokens != 2 {
+		t.Fatalf("range-limited snapshot = %+v", snapshot)
+	}
+}
+
 func TestMergeSnapshotSkipsDuplicateDetails(t *testing.T) {
 	t.Setenv("USAGE_DB_DRIVER", "sqlite")
 	t.Setenv("USAGE_DB_DSN", t.TempDir()+"/sql.db")
